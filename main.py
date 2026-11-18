@@ -1,17 +1,21 @@
 """BTC race bot, variant A: mean-reversion dip-buy, small sleeves.
 
 Strategy (tuned on the dev window; see BUILD-REPORT.json):
-- Warm up on the first 60 bars: build the 60-bar rolling mean/std and the
-  12/48 EMAs, trade nothing.
+- No signals before 61 closes: the 60-bar mean/std needs 61 closes
+  (WARMUP_BARS=30 is a minimum floor; the mean gate binds first).
 - Sleeve 1 (25% of equity) when the close dips DIP1_BPS below the 60-bar
-  mean and the medium trend is not strongly down (EMA12 >= EMA48).
+  mean, the dip clears STD_MULT_BPS percent of one 60-bar std
+  (100 = 1.0x), and the medium trend is not strongly down (EMA12 >= EMA48).
 - Sleeve 2 (another 25%) only on a deeper dip (DIP2_BPS) while sleeve 1
   is still held. Never more than 50% invested.
 - Each sleeve exits at TP_BPS above its fill, SL_BPS below its fill, or
-  when the close recovers to the rolling mean. 15-bar cooldown after any
-  stop-loss before a new buy.
-- Orders are sized against the latest close; max_slippage_bps caps the
-  fill move from that close (2 bps modelled slippage + impact included).
+  when the close recovers to the rolling mean. 5-bar cooldown after a
+  stop-loss fills (measured from the bar the stop printed; a rejected
+  stop sets no cooldown).
+- No new sleeve in the last LATE_CUTOFF_BARS bars: too little time left
+  for an exit to plausibly trigger.
+- Orders are sized as 25% of equity in quote units, capped by cash;
+  max_slippage_bps caps the fill move from the decision close.
 
 Determinism: integer math only, no clock, no environment, no randomness.
 The bot speaks agent-fun/bars-replay/v1 through the vendored SDK shim.
@@ -38,9 +42,17 @@ SL_BPS = 35
 SLEEVE_BPS = 2500
 STD_MULT_BPS = 100
 TREND_TOL_BPS = -100
-MAX_SLIP_BPS = 100
+MAX_SLIP_BPS = 40
 COOLDOWN_BARS = 5
-N_BARS = 1440
+# Competition-fixed window length (RULES.txt: 1,440 bars for both the dev
+# and race windows; the kit dataset is exactly 1,440). The harness also
+# rejects last-batch orders itself (after_end), so the gate below is
+# belt-and-braces only.
+WINDOW_BARS = 1440
+# No new sleeve unless at least this many bars remain: the dev window's
+# winning exits took 10-16 bars, so a later entry has little time left
+# for TP (+150 bps) or a mean recovery to plausibly trigger.
+LATE_CUTOFF_BARS = 15
 
 
 def isqrt(n):
@@ -66,6 +78,7 @@ class Bot:
         self.ema_slow = None
         self.lots = {}            # lot_id -> Lot
         self.pending_sells = {}   # sell client_id -> lot_id
+        self.sl_sells = {}        # stop-loss sell client_id -> decision seq
         self.last_sl_seq = -10 ** 9
         self.counter = 0
 
@@ -92,14 +105,16 @@ class Bot:
         std_bps = std * 10000 // mean if mean > 0 else 0
         return mean, std_bps
 
-    def _apply_fills(self, batch):
+    def _apply_fills(self, batch, seq):
         for fill in batch.get("fills", []):
             if fill.get("symbol") != SYMBOL:
                 continue
             cid = fill.get("client_id", "")
             status = fill.get("status")
             if status != "filled":
-                # A rejected sell frees its lot to exit again later.
+                # A rejected sell frees its lot to exit again later, and a
+                # rejected stop-loss sets no cooldown (no loss realized).
+                self.sl_sells.pop(cid, None)
                 if cid in self.pending_sells:
                     lot = self.lots.get(self.pending_sells.pop(cid))
                     if lot is not None:
@@ -111,12 +126,25 @@ class Bot:
                 if qty > 0:
                     self.lots[cid] = Lot(cid, qty, price)
             elif fill.get("side") == "sell":
+                # The cooldown clock starts only when a stop-loss actually
+                # fills (measured from the bar the stop printed, so the
+                # tuned 5-bar window is unchanged); a rejected stop never
+                # starts it.
+                if cid in self.sl_sells:
+                    self.last_sl_seq = self.sl_sells.pop(cid)
                 lot_id = self.pending_sells.pop(cid, None)
                 if lot_id is not None:
                     self.lots.pop(lot_id, None)
 
     def on_batch(self, state, batch):
-        self._apply_fills(batch)
+        seq = state.seq
+        self._apply_fills(batch, seq)
+        # A minute with no recorder sample carries no CBBTC bar: state.latest
+        # would still hold the previous close. Trade on real bars only --
+        # never append a stale close or decide orders on a gap batch.
+        # (Fills above are still applied: they arrive regardless of bars.)
+        if not any(b.get("symbol") == SYMBOL for b in batch.get("bars", [])):
+            return []
         bar = state.latest.get(SYMBOL)
         if bar is None:
             return []
@@ -125,8 +153,7 @@ class Bot:
             return []
         self.closes.append(close)
         self._ema_update(close)
-        seq = state.seq
-        if state.warming_up or seq < WARMUP_BARS or seq >= N_BARS - 1:
+        if state.warming_up or seq < WARMUP_BARS or seq >= WINDOW_BARS - 1:
             return []
         if len(self.closes) <= MEAN_WIN:
             return []
@@ -139,8 +166,8 @@ class Bot:
                 continue
             tp_price = lot.price * (10000 + TP_BPS) // 10000
             sl_price = lot.price * (10000 - SL_BPS) // 10000
-            if close <= sl_price:
-                self.last_sl_seq = seq
+            is_stop = close <= sl_price
+            if is_stop:
                 exit_now = True
             elif close >= tp_price or close >= mean:
                 exit_now = True
@@ -149,6 +176,8 @@ class Bot:
             if exit_now:
                 cid = self._next_id("x")
                 self.pending_sells[cid] = lot.lot_id
+                if is_stop:
+                    self.sl_sells[cid] = seq
                 lot.exiting = True
                 sold_this_bar = True
                 orders.append({"side": "sell", "symbol": SYMBOL, "qty": lot.qty,
@@ -158,15 +187,18 @@ class Bot:
         # --- entries: at most two sleeves, 25% of equity each ---
         if seq - self.last_sl_seq < COOLDOWN_BARS:
             return orders
+        if seq >= WINDOW_BARS - LATE_CUTOFF_BARS:
+            return orders
         held = sum(1 for lot in self.lots.values() if not lot.exiting)
         if held >= 2:
             return orders
         dip_bps = (mean - close) * 10000 // mean if close < mean else 0
         if dip_bps < DIP1_BPS:
             return orders
-        # The dip must also clear STD_MULT_BPS (in bps, 100 = 1.0x) of the
-        # 60-bar close std, so a dip is significant against local noise.
-        if dip_bps < STD_MULT_BPS * std_bps // 10000:
+        # The dip must also clear STD_MULT_BPS percent of one 60-bar std
+        # (100 = 1.0x), so a dip is significant against local noise:
+        # require dip_bps >= (STD_MULT_BPS / 100) * std_bps.
+        if dip_bps * 100 < STD_MULT_BPS * std_bps:
             return orders
         # "Not strongly down": the fast EMA may sit up to TREND_TOL_BPS
         # below the slow EMA; a deeper gap is a strong downtrend.
